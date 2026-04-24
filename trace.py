@@ -6,7 +6,8 @@ import os
 from collections import deque
 
 SCREENING_THRESHOLD = 0.01  # flag swaps where amount_in > 1% of total pool liquidity
-OUTLIER_THRESHOLD  = 0.90   # flag swaps where amount_in > 10% of total pool liquidity
+OUTLIER_REVENUE_THRESHOLD  = 0.90   # flag swaps where amount_in > 10% of total pool liquidity
+OUTLIAR_LOSS_THRESHOLD     = 0.2    # flag losses where victim's output USD value is >20% of their input USD value
 ARBITRAGE_LOOKAHEAD_BLOCKS = 10
 DEFAULT_DB        = "./transfers.db"
 DEFAULT_EXCHANGES = "./contracts/exchange.csv"
@@ -215,11 +216,11 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
                 print("        profit USD    :", f"{profit_usd:.6f}" if profit_usd is not None else "N/A")
                 print("        percentile    : over", placement)
                 if isinstance(placement, str) and placement.startswith("p"):
-                    if int(placement[1:]) >= OUTLIER_THRESHOLD * 100:
-                        print(f"        [outlier detected: profit exceeds {OUTLIER_THRESHOLD*100:.0f}th percentile]")
+                    if int(placement[1:]) >= OUTLIER_REVENUE_THRESHOLD * 100:
+                        print(f"        [outlier detected: profit exceeds {OUTLIER_REVENUE_THRESHOLD*100:.0f}th percentile]")
                 
-                if victim_out_usd/victim_in_usd > 0.2:
-                    print(f"        [outlier detected: loss exceeds 0.2x of victim's input USD value]")
+                if victim_out_usd/victim_in_usd > OUTLIAR_LOSS_THRESHOLD:
+                    print(f"        [outlier detected: loss exceeds {OUTLIAR_LOSS_THRESHOLD*100:.0f}th percentile]")
 
                 {
                     "attacker":     attacker,
