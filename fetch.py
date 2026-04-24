@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 
 # DEFAULT_URL = "https://rpc.hoodi.ethpandaops.io"
-DEFAULT_URL = "http://143.248.47.18:8545"
-# DEFAULT_URL = "https://sepolia-rollup.arbitrum.io/rpc"
+# DEFAULT_URL = "http://143.248.47.18:8545"
+DEFAULT_URL = "https://sepolia-rollup.arbitrum.io/rpc"
 
 
 
@@ -28,7 +28,11 @@ def json_rpc(url: str, method: str, params: list) -> dict:
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "CATCH-fetch/1.0 (+https://github.com)",
+        },
         method="POST",
     )
     try:

@@ -1,3 +1,6 @@
 address,name,accountType,type
 0x3ec9169ae7cbd3f8e4996729eca2fc11cd03ec3e,SLVRGOLD-ROUTER,contract,Exchange
 0x1cc449394d1f84750bad27cfb4c63365ca8ff83c,SLVRGOLD,contract,Exchange
+0x25AbB861450aF9040394dCa3F049E276F4298588, ArbitrumKITAPool1, contract, Exchange
+0x26752B7b756A90937b73330d04371eF3391d0672, ArbitrumKITAPool2, contract, Exchange
+0x1d10E653424559EAE013eAf7b58d36f34F7e542D, ArbitrumKITAPool3, contract, Exchange

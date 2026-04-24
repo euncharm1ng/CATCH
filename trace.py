@@ -7,6 +7,7 @@ from collections import deque
 
 SCREENING_THRESHOLD = 0.01  # flag swaps where amount_in > 1% of total pool liquidity
 OUTLIER_THRESHOLD  = 0.90   # flag swaps where amount_in > 10% of total pool liquidity
+ARBITRAGE_LOOKAHEAD_BLOCKS = 10
 DEFAULT_DB        = "./transfers.db"
 DEFAULT_EXCHANGES = "./contracts/exchange.csv"
 
@@ -158,9 +159,12 @@ def _build_swaps(tx_transfers, exchange_set):
     """
     swaps = []
     touched = (set(tx_transfers["source"]) | set(tx_transfers["target"])) & exchange_set
+    print("touched : ", touched)
     for exchange in touched:
         ins  = tx_transfers[tx_transfers["target"] == exchange]
         outs = tx_transfers[tx_transfers["source"] == exchange]
+        print("ins : ", ins)
+        print("outs : ", outs)
         if ins.empty or outs.empty:
             continue
         for _, in_row in ins.iterrows():
@@ -177,7 +181,7 @@ def _build_swaps(tx_transfers, exchange_set):
     return swaps
 
 
-def _amounts_close(a, b, tol=0.01):
+def _amounts_close(a, b, tol=0.03):
     mx = max(a, b)
     return mx == 0 or abs(a - b) / mx <= tol
 
@@ -211,6 +215,7 @@ def _start_end_pairs(swaps):
             and start["contract_address"]   != end["contract_address"]
             and start["from_address"]       == end["to_address"]
         ]
+        print("\n start, ends : ", (start, ends))
         if ends:
             pairs.append((start, ends))
     return pairs
@@ -242,10 +247,12 @@ def _find_arbitrages(swaps):
     """Return list of arbitrage dicts found among swaps in a single transaction."""
     results = []
     used    = []
+    print("start_end_pairs : ", _start_end_pairs(swaps))
     for start, ends in _start_end_pairs(swaps):
         if start in used:
             continue
         route = _shortest_route(start, [e for e in ends if e not in used], swaps)
+        print("\n route : ", route)
         if route is None:
             continue
         results.append({
@@ -274,17 +281,29 @@ def detect_arbitrage(victim_tx_hash, exchange_addr, transfers, exchange_map):
     exchange_set = set(exchange_map.keys())
 
     later = transfers[
-        (transfers["block_number"]      == victim_block) &
-        (transfers["transaction_index"] >  victim_index)
+        (
+            (
+                (transfers["block_number"] == victim_block) &
+                (transfers["transaction_index"] > victim_index)
+            )
+            |
+            (
+                (transfers["block_number"] > victim_block) &
+                (transfers["block_number"] <= victim_block + ARBITRAGE_LOOKAHEAD_BLOCKS)
+            )
+        )
     ]
+    print("later : ", later)
 
     for tx_hash, tx_transfers in later.groupby("transaction_hash"):
         # Only inspect transactions that touch the same pool
+        print("tx transfers : ", tx_transfers)
         if (exchange_addr not in tx_transfers["source"].values and
                 exchange_addr not in tx_transfers["target"].values):
             continue
 
         swaps = _build_swaps(tx_transfers, exchange_set)
+        print("swaps : ", swaps)
         if len(swaps) < 2:
             continue
 
