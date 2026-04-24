@@ -10,7 +10,8 @@ OUTLIER_THRESHOLD  = 0.90   # flag swaps where amount_in > 10% of total pool liq
 ARBITRAGE_LOOKAHEAD_BLOCKS = 10
 DEFAULT_DB        = "./transfers.db"
 DEFAULT_EXCHANGES = "./contracts/exchange.csv"
-
+DEFAULT_PRICE_ORACLE = "./utils/price_oracle.csv"
+DEFAULT_STATS       = "./utils/gain_stats.csv"
 
 def parse_reserve_data(hex_data):
     if not isinstance(hex_data, str) or not hex_data.startswith("0x"):
@@ -24,6 +25,45 @@ def parse_reserve_data(hex_data):
 def _s(h):
     """Truncate a hex address/hash to 0x + 8 chars for readable output."""
     return h[:10] + "..." if h and len(h) > 10 else h
+
+
+_PRICE_ORACLE_CACHE = None
+
+
+def _load_price_oracle(path=DEFAULT_PRICE_ORACLE):
+    prices = {}
+    if not os.path.exists(path):
+        return prices
+
+    with open(path, "r") as f:
+        for line in f:
+            parts = [p.strip() for p in line.strip().split(",")]
+            if len(parts) != 3:
+                continue
+            _, token_address, usd_price = parts
+            if token_address.lower() == "token_address":
+                continue
+            try:
+                prices[token_address.lower()] = float(usd_price)
+            except ValueError:
+                continue
+    return prices
+
+
+def _get_token_price_usd(token_address):
+    global _PRICE_ORACLE_CACHE
+    if not token_address:
+        return None
+    if _PRICE_ORACLE_CACHE is None:
+        _PRICE_ORACLE_CACHE = _load_price_oracle()
+    return _PRICE_ORACLE_CACHE.get(token_address.lower().strip())
+
+
+def _to_usd(amount_raw, token_address, decimals=18):
+    price = _get_token_price_usd(token_address)
+    if price is None:
+        return None
+    return (float(amount_raw) / (10 ** decimals)) * price
 
 
 def calculate_catch_metrics(tx_hash, current_addr, exchange_addr, transfers, threshold=SCREENING_THRESHOLD):
@@ -131,12 +171,56 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
                 print(f"        backrun  : {_s(a2['transaction_hash'])}  (idx {a2['transaction_index']})")
                 if profit_str:
                     print(f"       {profit_str}")
+                victim_paid = transfers[
+                    (transfers["transaction_hash"] == victim_tx_hash) &
+                    (transfers["source"] == victim_addr) &
+                    (transfers["target"] == exchange_addr)
+                ]
 
-                # TODO: 
-                # 0. use the data below
-                # 1. estimate profit in a common unit (e.g. USD) using token price data (coingecko API or on-chain price oracles)
-                # 2. compare the estimated profit to the statistics to how much outlier this is. 
-                # 3. add to cluster if this outlier exceeds the OUTLIER_THRESHOLD, else return None. 
+                victim_token_in = None
+                victim_amount_in = None
+                if not victim_paid.empty:
+                    victim_token_in = victim_paid.iloc[0]["address"]
+                    victim_amount_in = float(victim_paid.iloc[0]["amount"])
+
+                victim_token_out = received.iloc[0]["address"]
+                victim_amount_out = float(received.iloc[0]["amount"])
+
+                victim_in_usd = (
+                    _to_usd(victim_amount_in, victim_token_in)
+                    if victim_token_in is not None and victim_amount_in is not None
+                    else None
+                )
+                victim_out_usd = _to_usd(victim_amount_out, victim_token_out)
+                profit_usd = (
+                    _to_usd(profit_amount, profit_token)
+                    if profit_token is not None and profit_amount is not None
+                    else None
+                )
+
+                placement = "N/A"
+                if profit_usd is not None and os.path.exists(DEFAULT_STATS):
+                    with open(DEFAULT_STATS, "r") as f:
+                        next(f, None)
+                        for line in f:
+                            percentile, value_usd = [p.strip() for p in line.strip().split(",")]
+                            if profit_usd > float(value_usd):
+                                placement = percentile
+                                break
+
+                print("\n        victim in :", f"{victim_amount_in:.4e}" if victim_amount_in is not None else "N/A", f"token={_s(victim_token_in)}")
+                print("        victim out:", f"{victim_amount_out:.4e}", f"token={_s(victim_token_out)}")
+                print("        victim in USD :", f"{victim_in_usd:.6f}" if victim_in_usd is not None else "N/A")
+                print("        victim out USD:", f"{victim_out_usd:.6f}" if victim_out_usd is not None else "N/A")
+                print("        profit USD    :", f"{profit_usd:.6f}" if profit_usd is not None else "N/A")
+                print("        percentile    : over", placement)
+                if isinstance(placement, str) and placement.startswith("p"):
+                    if int(placement[1:]) >= OUTLIER_THRESHOLD * 100:
+                        print(f"        [outlier detected: profit exceeds {OUTLIER_THRESHOLD*100:.0f}th percentile]")
+                
+                if victim_out_usd/victim_in_usd > 0.2:
+                    print(f"        [outlier detected: loss exceeds 0.2x of victim's input USD value]")
+
                 {
                     "attacker":     attacker,
                     "profit_token": profit_token,
@@ -215,7 +299,6 @@ def _start_end_pairs(swaps):
             and start["contract_address"]   != end["contract_address"]
             and start["from_address"]       == end["to_address"]
         ]
-        print("\n start, ends : ", (start, ends))
         if ends:
             pairs.append((start, ends))
     return pairs
@@ -247,12 +330,10 @@ def _find_arbitrages(swaps):
     """Return list of arbitrage dicts found among swaps in a single transaction."""
     results = []
     used    = []
-    print("start_end_pairs : ", _start_end_pairs(swaps))
     for start, ends in _start_end_pairs(swaps):
         if start in used:
             continue
         route = _shortest_route(start, [e for e in ends if e not in used], swaps)
-        print("\n route : ", route)
         if route is None:
             continue
         results.append({
@@ -293,17 +374,14 @@ def detect_arbitrage(victim_tx_hash, exchange_addr, transfers, exchange_map):
             )
         )
     ]
-    print("later : ", later)
 
     for tx_hash, tx_transfers in later.groupby("transaction_hash"):
         # Only inspect transactions that touch the same pool
-        print("tx transfers : ", tx_transfers)
         if (exchange_addr not in tx_transfers["source"].values and
                 exchange_addr not in tx_transfers["target"].values):
             continue
 
         swaps = _build_swaps(tx_transfers, exchange_set)
-        print("swaps : ", swaps)
         if len(swaps) < 2:
             continue
 
