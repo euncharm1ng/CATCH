@@ -7,7 +7,13 @@ import sqlite3
 import glob
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-SYNC_TOPIC     = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
+V2_SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
+V3_SWAP_TOPIC = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+# Reserve topics to screen. Add/remove entries to control extraction coverage.
+SYNC_TOPICS = [
+    V2_SYNC_TOPIC,
+    V3_SWAP_TOPIC,
+]
 ETH_ADDRESS    = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
 RAW_DIR     = "raw"
@@ -18,6 +24,55 @@ FIELDNAMES = [
     "token_address", "from_address", "to_address", "value",
     "transaction_index", "transaction_hash", "block_number", "reserve_data",
 ]
+
+
+def _to_uint256_words(reserve0, reserve1):
+    return f"0x{reserve0:064x}{reserve1:064x}"
+
+
+def _decode_v3_swap_to_reserve_data(data_hex):
+    """Convert a Uniswap V3 Swap log data payload into V2-shaped reserve_data words.
+
+    The returned value is a 2-word hex string (reserve0, reserve1) so downstream
+    consumers can parse it with the existing reserve parser.
+    """
+    if not isinstance(data_hex, str) or not data_hex.startswith("0x"):
+        return ""
+
+    clean = data_hex[2:]
+    words = [clean[i:i + 64] for i in range(0, len(clean), 64)]
+    if len(words) < 5:
+        return ""
+
+    try:
+        sqrt_price_x96 = int(words[2], 16)
+        liquidity = int(words[3], 16)
+    except ValueError:
+        return ""
+
+    if sqrt_price_x96 == 0 or liquidity == 0:
+        return ""
+
+    # Active-range virtual reserves derived from V3 state:
+    # reserve0 = L / sqrt(P), reserve1 = L * sqrt(P), with sqrt(P)=sqrtPriceX96/2^96.
+    reserve0 = (liquidity << 96) // sqrt_price_x96
+    reserve1 = (liquidity * sqrt_price_x96) >> 96
+    return _to_uint256_words(reserve0, reserve1)
+
+
+def _decode_v2_sync_to_reserve_data(data_hex):
+    if not isinstance(data_hex, str) or not data_hex.startswith("0x"):
+        return ""
+    clean = data_hex[2:]
+    if len(clean) < 128:
+        return ""
+    return "0x" + clean[:128]
+
+
+RESERVE_DECODER_BY_TOPIC = {
+    V2_SYNC_TOPIC: _decode_v2_sync_to_reserve_data,
+    V3_SWAP_TOPIC: _decode_v3_swap_to_reserve_data,
+}
 
 
 def extract_transfers(file_path):
@@ -48,8 +103,20 @@ def extract_transfers(file_path):
     tx_sync_data = {}
     for log in logs_data:
         topics = log.get("topics", [])
-        if topics and topics[0] == SYNC_TOPIC:
-            tx_sync_data[log.get("transactionHash")] = log.get("data")
+        if not topics:
+            continue
+        topic0 = topics[0]
+        if topic0 not in SYNC_TOPICS:
+            continue
+
+        decoder = RESERVE_DECODER_BY_TOPIC.get(topic0)
+        if decoder is None:
+            continue
+
+        tx_hash = log.get("transactionHash")
+        reserve_data = decoder(log.get("data", ""))
+        if tx_hash and reserve_data:
+            tx_sync_data[tx_hash] = reserve_data
 
     all_transfers = []
 

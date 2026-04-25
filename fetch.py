@@ -7,8 +7,8 @@ import urllib.request
 
 # DEFAULT_URL = "https://rpc.hoodi.ethpandaops.io"
 # DEFAULT_URL = "http://143.248.47.18:8545"
-DEFAULT_URL = "https://sepolia-rollup.arbitrum.io/rpc"
-
+# DEFAULT_URL = "https://sepolia-rollup.arbitrum.io/rpc"
+DEFAULT_URL = "https://ethereum-rpc.publicnode.com"
 
 
 def to_hex_block(block_number: int) -> str:

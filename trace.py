@@ -3,6 +3,7 @@ import sqlite3
 import pandas as pd
 import sys
 import os
+import json
 from collections import deque
 
 SCREENING_THRESHOLD = 0.01  # flag swaps where amount_in > 1% of total pool liquidity
@@ -13,6 +14,9 @@ DEFAULT_DB        = "./transfers.db"
 DEFAULT_EXCHANGES = "./contracts/exchange.csv"
 DEFAULT_PRICE_ORACLE = "./utils/price_oracle.csv"
 DEFAULT_STATS       = "./utils/gain_stats.csv"
+DEFAULT_RAW_DIR     = "./raw"
+
+_TX_SENDER_CACHE = {}
 
 def parse_reserve_data(hex_data):
     if not isinstance(hex_data, str) or not hex_data.startswith("0x"):
@@ -21,6 +25,41 @@ def parse_reserve_data(hex_data):
     if len(clean) >= 128:
         return int(clean[:64], 16), int(clean[64:128], 16)
     return 0, 0
+
+
+def _load_block_tx_sender_map(block_number, raw_dir=DEFAULT_RAW_DIR):
+    """Load tx_hash->sender map for a block from raw/<block_number>.json."""
+    if block_number in _TX_SENDER_CACHE:
+        return _TX_SENDER_CACHE[block_number]
+
+    path = os.path.join(raw_dir, f"{int(block_number)}.json")
+    sender_map = {}
+
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+            block = payload.get("block", {})
+            if isinstance(block, dict) and "result" in block:
+                block = block["result"]
+            txs = block.get("transactions", []) if isinstance(block, dict) else []
+            for tx in txs:
+                tx_hash = (tx.get("hash") or "").lower()
+                tx_from = (tx.get("from") or "").lower()
+                if tx_hash and tx_from:
+                    sender_map[tx_hash] = tx_from
+        except (OSError, ValueError, TypeError):
+            sender_map = {}
+
+    _TX_SENDER_CACHE[block_number] = sender_map
+    return sender_map
+
+
+def _get_tx_sender(tx_hash, block_number, raw_dir=DEFAULT_RAW_DIR):
+    if tx_hash is None or block_number is None:
+        return None
+    sender_map = _load_block_tx_sender_map(block_number, raw_dir=raw_dir)
+    return sender_map.get(str(tx_hash).lower())
 
 
 def _s(h):
@@ -87,7 +126,7 @@ def calculate_catch_metrics(tx_hash, current_addr, exchange_addr, transfers, thr
     r0, r1 = parse_reserve_data(reserve_rows.iloc[0]["reserve_data"])
     if r0 == 0 and r1 == 0:
         raise ValueError(f"Invalid reserve data in {tx_hash}")
-
+    
     # Sync fires after the swap, so back-calculate the pre-swap input reserve.
     # token0 is the lexicographically smaller address (Uniswap V2 convention).
     r_in_post   = r0 if token_in < token_out else r1
@@ -101,7 +140,7 @@ def calculate_catch_metrics(tx_hash, current_addr, exchange_addr, transfers, thr
 
 # ── Sandwich detection ──────────────────────────────────────────────────────────────
 
-def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, threshold=0.01):
+def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, threshold=0.02):
     received = transfers[
         (transfers["transaction_hash"] == victim_tx_hash) &
         (transfers["source"] == exchange_addr) &
@@ -114,7 +153,6 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
     victim_index = received.iloc[0]["transaction_index"]
 
     by_token = transfers[transfers["address"] == token_out]
-
     potential_a1 = by_token[
         (by_token["transaction_index"] < victim_index) &
         (by_token["source"] == exchange_addr)
@@ -123,6 +161,7 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
         (by_token["transaction_index"] > victim_index) &
         (by_token["target"] == exchange_addr)
     ]
+    
     if potential_a1.empty or potential_a2.empty:
         return None
 
@@ -138,6 +177,7 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
             if max_val == 0:
                 continue
             if abs(amount_a2 - amount_a1) / max_val <= threshold:
+                # Detect when the output of the fronbun matches the input of the backrun, and calculate profit if possible.
                 # Profit = backrun token_out_amount - frontrun token_in_amount
                 # (both in the token the sandwicher starts and ends with, i.e. the
                 #  token they sent into the exchange on the frontrun)
@@ -165,11 +205,18 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
                     f"  profit={profit_amount:.4e}  token={_s(profit_token)}"
                     if profit_amount is not None else ""
                 )
+
+                block_number = a1.get("block_number")
+                frontrun_sender = _get_tx_sender(a1["transaction_hash"], block_number)
+                backrun_sender = _get_tx_sender(a2["transaction_hash"], block_number)
+                
                 print(f"      [sandwich found]")
                 print(f"        attacker : {attacker}")
                 print(f"        frontrun : {_s(a1['transaction_hash'])}  (idx {a1['transaction_index']})")
+                print(f"        frontrun sender : {frontrun_sender or 'N/A'}")
                 print(f"        victim   : {_s(victim_tx_hash)}  (idx {victim_index})")
                 print(f"        backrun  : {_s(a2['transaction_hash'])}  (idx {a2['transaction_index']})")
+                print(f"        backrun sender  : {backrun_sender or 'N/A'}")
                 if profit_str:
                     print(f"       {profit_str}")
                 victim_paid = transfers[
@@ -219,7 +266,7 @@ def detect_sandwich(victim_tx_hash, victim_addr, exchange_addr, transfers, thres
                     if int(placement[1:]) >= OUTLIER_REVENUE_THRESHOLD * 100:
                         print(f"        [outlier detected: profit exceeds {OUTLIER_REVENUE_THRESHOLD*100:.0f}th percentile]")
                 
-                if victim_out_usd/victim_in_usd > OUTLIAR_LOSS_THRESHOLD:
+                if victim_out_usd/victim_in_usd > OUTLIAR_LOSS_THRESHOLD if victim_in_usd is not None and victim_out_usd is not None else False:
                     print(f"        [outlier detected: loss exceeds {OUTLIAR_LOSS_THRESHOLD*100:.0f}th percentile]")
 
                 {
@@ -456,7 +503,7 @@ def trace_address(target_addr, transfers, exchanges, max_depth=100, mode=None):
         if d >= max_depth:
             continue
 
-        print(f"\n[{d}]  {current}")
+        # print(f"\n[{d}]  {current}")
 
         outgoing = transfers[transfers["source"] == current][
             ["target", "address", "transaction_hash", "amount"]
